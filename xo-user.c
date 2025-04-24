@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/select.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "game.h"
@@ -46,7 +47,6 @@ static void raw_mode_enable(void)
     tcgetattr(STDIN_FILENO, &orig_termios);
     atexit(raw_mode_disable);
     struct termios raw = orig_termios;
-    raw.c_iflag &= ~IXON;
     raw.c_lflag &= ~(ECHO | ICANON);
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 }
@@ -67,7 +67,7 @@ static void listen_keyboard_handler(void)
             read_attr ^= 1;
             write(attr_fd, buf, 6);
             if (!read_attr)
-                printf("\n\nStopping to display the chess board...\n");
+                printf("Stopping to display the chess board...\n");
             break;
         case 17: /* Ctrl-Q */
             read(attr_fd, buf, 6);
@@ -75,7 +75,7 @@ static void listen_keyboard_handler(void)
             read_attr = false;
             end_attr = true;
             write(attr_fd, buf, 6);
-            printf("\n\nStopping the kernel space tic-tac-toe game...\n");
+            printf("Stopping the kernel space tic-tac-toe game...\n");
             break;
         }
     }
@@ -99,6 +99,11 @@ int main(int argc, char *argv[])
     read_attr = true;
     end_attr = false;
 
+    // Variable for time
+    time_t rawtime;
+    struct tm *timeinfo;
+    char time_buffer[80];
+
     while (!end_attr) {
         FD_ZERO(&readset);
         FD_SET(STDIN_FILENO, &readset);
@@ -117,7 +122,12 @@ int main(int argc, char *argv[])
             FD_CLR(device_fd, &readset);
             printf("\033[H\033[J"); /* ASCII escape code to clear the screen */
             read(device_fd, display_buf, DRAWBUFFER_SIZE);
-            display_buf[DRAWBUFFER_SIZE - 1] = '\0';
+            // Print the time
+            time(&rawtime);
+            timeinfo = localtime(&rawtime);
+            strftime(time_buffer, sizeof(time_buffer), "%Y-%m-%d %H:%M:%S",
+                     timeinfo);
+            printf("Time: %s\n", time_buffer);
             printf("%s", display_buf);
         }
     }
