@@ -3,8 +3,10 @@
 #include <linux/cdev.h>
 #include <linux/circ_buf.h>
 #include <linux/interrupt.h>
+#include <linux/jiffies.h>
 #include <linux/kfifo.h>
 #include <linux/module.h>
+#include <linux/sched/signal.h>
 #include <linux/slab.h>
 #include <linux/sysfs.h>
 #include <linux/version.h>
@@ -12,9 +14,9 @@
 #include <linux/workqueue.h>
 
 #include "game.h"
+#include "load.h"
 #include "mcts.h"
 #include "negamax.h"
-
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
 MODULE_DESCRIPTION("In-kernel Tic-Tac-Toe game engine");
@@ -31,7 +33,7 @@ MODULE_DESCRIPTION("In-kernel Tic-Tac-Toe game engine");
 #define NR_KMLDRV 1
 
 static int delay = 100; /* time (in ms) to generate an event */
-
+struct Load *load;      /*Create load to store the average load*/
 /* Declare kernel module attribute for sysfs */
 
 struct kxo_attr {
@@ -80,6 +82,7 @@ static struct cdev kxo_cdev;
 
 // static char draw_buffer[DRAWBUFFER_SIZE];
 static char table[N_GRIDS];
+static char load_buf[128];
 
 /* Data are stored into a kfifo buffer before passing them to the userspace */
 static DECLARE_KFIFO_PTR(rx_fifo, unsigned char);
@@ -96,7 +99,22 @@ static DECLARE_WAIT_QUEUE_HEAD(rx_wait);
 /* Insert the whole chess board into the kfifo buffer */
 static void produce_board(void)
 {
-    unsigned int len = kfifo_in(&rx_fifo, table, sizeof(table));
+    pr_info("The one miniute avg load for ai is %lld\n", load->one_min_load);
+    int str_len = snprintf(
+        load_buf, sizeof(load_buf), "1min: %10llu 5min: %10llu 15min: %10llu",
+        load->one_min_load, load->five_min_load, load->fifteen_min_load);
+
+    if (str_len < 0) {
+        pr_warn_ratelimited("snprintf error\n");
+        return;
+    }
+
+    unsigned int len = kfifo_in(&rx_fifo, load_buf, str_len);
+    // Push the load buffer into fifo
+    if (unlikely(len < str_len))
+        pr_warn_ratelimited("%s: %d bytes dropped\n", __func__, str_len - len);
+    // Push the board buffer into fifo
+    len = kfifo_in(&rx_fifo, table, sizeof(table));
     if (unlikely(len < sizeof(table)))
         pr_warn_ratelimited("%s: %zu bytes dropped\n", __func__,
                             sizeof(table) - len);
@@ -189,6 +207,7 @@ static void ai_one_work_func(struct work_struct *w)
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
     pr_info("kxo: [CPU#%d] %s completed in %llu usec\n", cpu, __func__,
             (unsigned long long) nsecs >> 10);
+    renew_load(load, (unsigned long long) nsecs >> 10);
     put_cpu();
 }
 
@@ -417,6 +436,12 @@ static int __init kxo_init(void)
 {
     dev_t dev_id;
     int ret;
+    load = kmalloc(sizeof(struct Load), GFP_KERNEL);
+    if (!load) {
+        pr_info("Failed to allocate memory for Load!\n");
+        goto error_alloc;
+    }
+    init_load(load); /*Initialize the structure*/
 
     if (kfifo_alloc(&rx_fifo, PAGE_SIZE, GFP_KERNEL) < 0)
         return -ENOMEM;
@@ -500,6 +525,7 @@ error_region:
     unregister_chrdev_region(dev_id, NR_KMLDRV);
 error_alloc:
     kfifo_free(&rx_fifo);
+    kfree(load);
     goto out;
 }
 

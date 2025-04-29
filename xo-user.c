@@ -111,7 +111,8 @@ int main(int argc, char *argv[])
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
     char display_buf[DRAWBUFFER_SIZE];
-    char table[DRAWBUFFER_SIZE];
+    char table[N_GRIDS];
+    char load_buf[51];
 
     fd_set readset;
     int device_fd = open(XO_DEVICE_FILE, O_RDONLY);
@@ -141,13 +142,17 @@ int main(int argc, char *argv[])
         } else if (read_attr && FD_ISSET(device_fd, &readset)) {
             FD_CLR(device_fd, &readset);
             printf("\033[H\033[J"); /* ASCII escape code to clear the screen */
-            read(device_fd, table, DRAWBUFFER_SIZE);
+            read(device_fd, load_buf, 51);
+            read(device_fd, table, N_GRIDS);
             // Print the time
             time(&rawtime);
             timeinfo = localtime(&rawtime);
             strftime(time_buffer, sizeof(time_buffer), "%Y-%m-%d %H:%M:%S",
                      timeinfo);
             printf("Time: %s\n", time_buffer);
+            // Print the load
+            printf("%s", load_buf);
+            // Draw the board
             draw_board(display_buf, table);
             printf("%s", display_buf);
         }
