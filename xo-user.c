@@ -112,7 +112,7 @@ int main(int argc, char *argv[])
 
     char display_buf[DRAWBUFFER_SIZE];
     char table[N_GRIDS];
-    char load_buf[51];
+    char load_buf[LOAD_SIZE];
 
     fd_set readset;
     int device_fd = open(XO_DEVICE_FILE, O_RDONLY);

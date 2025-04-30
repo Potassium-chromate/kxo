@@ -82,7 +82,7 @@ static struct cdev kxo_cdev;
 
 // static char draw_buffer[DRAWBUFFER_SIZE];
 static char table[N_GRIDS];
-static char load_buf[128];
+static char load_buf[LOAD_SIZE];
 
 /* Data are stored into a kfifo buffer before passing them to the userspace */
 static DECLARE_KFIFO_PTR(rx_fifo, unsigned char);
@@ -108,7 +108,6 @@ static void produce_board(void)
         pr_warn_ratelimited("snprintf error\n");
         return;
     }
-
     unsigned int len = kfifo_in(&rx_fifo, load_buf, str_len);
     // Push the load buffer into fifo
     if (unlikely(len < str_len))

@@ -4,6 +4,7 @@
 #define GOAL 3
 #define ALLOW_EXCEED 1
 #define N_GRIDS (BOARD_SIZE * BOARD_SIZE)
+#define LOAD_SIZE 64
 #define GET_INDEX(i, j) ((i) * (BOARD_SIZE) + (j))
 #define GET_COL(x) ((x) % BOARD_SIZE)
 #define GET_ROW(x) ((x) / BOARD_SIZE)
