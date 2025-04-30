@@ -82,7 +82,22 @@ static void listen_keyboard_handler(void)
     close(attr_fd);
 }
 
-static int draw_board(char *display_buf, char *table)
+static char table_parser(uint32_t table, int k)
+{
+    uint32_t grid_val = (table >> (k << 1)) & 0b11;
+    if (grid_val == 0)
+        return ' ';
+    else if (grid_val == 0b01)
+        return 'X';
+    else if (grid_val == 0b10)
+        return 'O';
+    else {
+        printf("Unexpect value %u\n", grid_val);
+        return ' ';
+    }
+}
+
+static int draw_board(char *display_buf, uint32_t table)
 {
     int i = 0, k = 0;
     display_buf[i++] = '\n';
@@ -90,7 +105,7 @@ static int draw_board(char *display_buf, char *table)
 
     while (i < DRAWBUFFER_SIZE) {
         for (int j = 0; j < (BOARD_SIZE << 1) - 1 && k < N_GRIDS; j++) {
-            display_buf[i++] = j & 1 ? '|' : table[k++];
+            display_buf[i++] = j & 1 ? '|' : table_parser(table, k++);
         }
         display_buf[i++] = '\n';
         for (int j = 0; j < (BOARD_SIZE << 1) - 1; j++) {
@@ -111,7 +126,7 @@ int main(int argc, char *argv[])
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
     char display_buf[DRAWBUFFER_SIZE];
-    char table[N_GRIDS];
+    uint32_t table;
     char load_buf[LOAD_SIZE];
 
     fd_set readset;
@@ -143,7 +158,7 @@ int main(int argc, char *argv[])
             FD_CLR(device_fd, &readset);
             printf("\033[H\033[J"); /* ASCII escape code to clear the screen */
             read(device_fd, load_buf, 51);
-            read(device_fd, table, N_GRIDS);
+            read(device_fd, &table, sizeof(table));
             // Print the time
             time(&rawtime);
             timeinfo = localtime(&rawtime);

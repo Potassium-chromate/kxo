@@ -67,3 +67,15 @@ int *available_moves(const char *table)
         moves[m] = -1;
     return moves;
 }
+
+u32 table_compressor(const char *table)
+{
+    u32 ret = 0;
+    for (int i = 0; i < N_GRIDS; i++) {
+        if (table[i] == 'X')
+            ret |= (0b01 << (i << 1));
+        else if (table[i] == 'O')
+            ret |= (0b10 << (i << 1));
+    }
+    return ret;
+}

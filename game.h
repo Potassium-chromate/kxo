@@ -1,3 +1,11 @@
+#ifdef __KERNEL__
+#include <linux/types.h>
+#else
+#include <stdint.h>
+typedef uint32_t u32;
+#endif
+
+
 #pragma once
 
 #define BOARD_SIZE 4
@@ -38,3 +46,5 @@ extern const line_t lines[4];
 int *available_moves(const char *table);
 char check_win(const char *t);
 fixed_point_t calculate_win_value(char win, char player);
+
+u32 table_compressor(const char *table);

@@ -80,7 +80,14 @@ static int major;
 static struct class *kxo_class;
 static struct cdev kxo_cdev;
 
-// static char draw_buffer[DRAWBUFFER_SIZE];
+/*
+ * Use an int to store the table state. Each grid is represented by
+ * two bits. With 16 grids in total, a 32-bit int can store the entire
+ * table efficiently.
+ * 00: ""
+ * 01: "X"
+ * 10: "O"
+ */
 static char table[N_GRIDS];
 static char load_buf[LOAD_SIZE];
 
@@ -99,7 +106,6 @@ static DECLARE_WAIT_QUEUE_HEAD(rx_wait);
 /* Insert the whole chess board into the kfifo buffer */
 static void produce_board(void)
 {
-    pr_info("The one miniute avg load for ai is %lld\n", load->one_min_load);
     int str_len = snprintf(
         load_buf, sizeof(load_buf), "1min: %10llu 5min: %10llu 15min: %10llu",
         load->one_min_load, load->five_min_load, load->fifteen_min_load);
@@ -113,7 +119,10 @@ static void produce_board(void)
     if (unlikely(len < str_len))
         pr_warn_ratelimited("%s: %d bytes dropped\n", __func__, str_len - len);
     // Push the board buffer into fifo
-    len = kfifo_in(&rx_fifo, table, sizeof(table));
+    u32 compressed_table = table_compressor(table);
+    pr_info("table: %s\n", table);
+    pr_info("Compressed table: %x\n", compressed_table);
+    len = kfifo_in(&rx_fifo, (u8 *) &compressed_table, sizeof(u32));
     if (unlikely(len < sizeof(table)))
         pr_warn_ratelimited("%s: %zu bytes dropped\n", __func__,
                             sizeof(table) - len);
