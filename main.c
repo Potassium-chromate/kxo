@@ -88,8 +88,11 @@ static struct cdev kxo_cdev;
  * 01: "X"
  * 10: "O"
  */
-static char table[N_GRIDS];
+static game_state *game_state_1;
+static game_state *game_state_2;
 static char load_buf[LOAD_SIZE];
+static struct tasklet_struct game_tasklet1;
+static struct tasklet_struct game_tasklet2;
 
 /* Data are stored into a kfifo buffer before passing them to the userspace */
 static DECLARE_KFIFO_PTR(rx_fifo, unsigned char);
@@ -118,14 +121,18 @@ static void produce_board(void)
     // Push the load buffer into fifo
     if (unlikely(len < str_len))
         pr_warn_ratelimited("%s: %d bytes dropped\n", __func__, str_len - len);
-    // Push the board buffer into fifo
-    u32 compressed_table = table_compressor(table);
-    pr_info("table: %s\n", table);
-    pr_info("Compressed table: %x\n", compressed_table);
+    // Push the game1's table into fifo
+    u32 compressed_table = table_compressor(game_state_1->table);
     len = kfifo_in(&rx_fifo, (u8 *) &compressed_table, sizeof(u32));
-    if (unlikely(len < sizeof(table)))
+    if (unlikely(len < sizeof(game_state_1->table)))
         pr_warn_ratelimited("%s: %zu bytes dropped\n", __func__,
-                            sizeof(table) - len);
+                            sizeof(game_state_1->table) - len);
+    // Push the game2's table into fifo
+    compressed_table = table_compressor(game_state_2->table);
+    len = kfifo_in(&rx_fifo, (u8 *) &compressed_table, sizeof(u32));
+    if (unlikely(len < sizeof(game_state_2->table)))
+        pr_warn_ratelimited("%s: %zu bytes dropped\n", __func__,
+                            sizeof(game_state_2->table) - len);
     pr_debug("kxo: %s: in %u/%u bytes\n", __func__, len, kfifo_len(&rx_fifo));
 }
 
@@ -181,9 +188,6 @@ static void drawboard_work_func(struct work_struct *w)
     wake_up_interruptible(&rx_wait);
 }
 
-static char turn;
-static int finish;
-
 static void ai_one_work_func(struct work_struct *w)
 {
     ktime_t tv_start, tv_end;
@@ -191,6 +195,10 @@ static void ai_one_work_func(struct work_struct *w)
 
     int cpu;
 
+    struct ai_work *ai = container_of(w, struct ai_work, work);
+    game_state *state = (ai->game_num == 1) ? game_state_1 : game_state_2;
+
+    READ_ONCE(state);
     WARN_ON_ONCE(in_softirq());
     WARN_ON_ONCE(in_interrupt());
 
@@ -199,24 +207,28 @@ static void ai_one_work_func(struct work_struct *w)
     tv_start = ktime_get();
     mutex_lock(&producer_lock);
     int move;
-    WRITE_ONCE(move, mcts(table, 'O'));
+
+    WRITE_ONCE(move, mcts(state->table, 'O'));
 
     smp_mb();
 
-    if (move != -1)
-        WRITE_ONCE(table[move], 'O');
-
-    WRITE_ONCE(turn, 'X');
-    WRITE_ONCE(finish, 1);
+    if (move != -1 && state->turn == 'O') {
+        WRITE_ONCE(state->table[move], 'O');
+    }
+    WRITE_ONCE(state->turn, 'X');
+    WRITE_ONCE(state->finish, 1);
+    if (ai->game_num == 1)
+        pr_info("State for game1 (O) %s\n", game_state_1->table);
     smp_wmb();
     mutex_unlock(&producer_lock);
     tv_end = ktime_get();
 
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
-    pr_info("kxo: [CPU#%d] %s completed in %llu usec\n", cpu, __func__,
-            (unsigned long long) nsecs >> 10);
+    pr_info("kxo: [CPU#%d] %s completed in %llu usec (game %d)\n", cpu,
+            __func__, (unsigned long long) nsecs >> 10, ai->game_num);
     renew_load(load, (unsigned long long) nsecs >> 10);
     put_cpu();
+    kfree(ai);
 }
 
 static void ai_two_work_func(struct work_struct *w)
@@ -226,6 +238,10 @@ static void ai_two_work_func(struct work_struct *w)
 
     int cpu;
 
+    struct ai_work *ai = container_of(w, struct ai_work, work);
+    game_state *state = (ai->game_num == 1) ? game_state_1 : game_state_2;
+
+    READ_ONCE(state);
     WARN_ON_ONCE(in_softirq());
     WARN_ON_ONCE(in_interrupt());
 
@@ -234,23 +250,27 @@ static void ai_two_work_func(struct work_struct *w)
     tv_start = ktime_get();
     mutex_lock(&producer_lock);
     int move;
-    WRITE_ONCE(move, negamax_predict(table, 'X').move);
+    WRITE_ONCE(move, negamax_predict(state->table, 'X').move);
 
     smp_mb();
 
-    if (move != -1)
-        WRITE_ONCE(table[move], 'X');
+    if (move != -1 && state->turn == 'X') {
+        WRITE_ONCE(state->table[move], 'X');
+    }
 
-    WRITE_ONCE(turn, 'O');
-    WRITE_ONCE(finish, 1);
+    WRITE_ONCE(state->turn, 'O');
+    WRITE_ONCE(state->finish, 1);
+    if (ai->game_num == 1)
+        pr_info("State for game1 (X) %s\n", game_state_1->table);
     smp_wmb();
     mutex_unlock(&producer_lock);
     tv_end = ktime_get();
 
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
-    pr_info("kxo: [CPU#%d] %s completed in %llu usec\n", cpu, __func__,
-            (unsigned long long) nsecs >> 10);
+    pr_info("kxo: [CPU#%d] %s completed in %llu usec (game %d)\n", cpu,
+            __func__, (unsigned long long) nsecs >> 10, ai->game_num);
     put_cpu();
+    kfree(ai);
 }
 
 /* Workqueue for asynchronous bottom-half processing */
@@ -260,17 +280,36 @@ static struct workqueue_struct *kxo_workqueue;
  * asynchronously.
  */
 static DECLARE_WORK(drawboard_work, drawboard_work_func);
-static DECLARE_WORK(ai_one_work, ai_one_work_func);
-static DECLARE_WORK(ai_two_work, ai_two_work_func);
-
 /* Tasklet handler.
  *
  * NOTE: different tasklets can run concurrently on different processors, but
  * two of the same type of tasklet cannot run simultaneously. Moreover, a
  * tasklet always runs on the same CPU that schedules it.
  */
-static void game_tasklet_func(unsigned long __data)
+static void game_tasklet_func(struct tasklet_struct *t)
 {
+    /* Fetech game number */
+    unsigned long game_num = t->data;
+    /* malloc a work struct */
+    struct ai_work *ai = kmalloc(sizeof(*ai), GFP_ATOMIC);
+    if (!ai)
+        return;
+
+    READ_ONCE(game_state_1);
+    READ_ONCE(game_state_2);
+    game_state *state = (game_num == 1) ? game_state_1 : game_state_2;
+    ai->game_num = game_num;
+    READ_ONCE(state->turn);
+    if (state->turn == 'O') {
+        INIT_WORK(&ai->work, ai_one_work_func);
+    } else {
+        INIT_WORK(&ai->work, ai_two_work_func);
+    }
+
+    /* Add the ai_work to kxo_workqueue */
+    queue_work(kxo_workqueue, &ai->work);
+
+
     ktime_t tv_start, tv_end;
     s64 nsecs;
 
@@ -279,38 +318,34 @@ static void game_tasklet_func(unsigned long __data)
 
     tv_start = ktime_get();
 
-    READ_ONCE(finish);
-    READ_ONCE(turn);
+    READ_ONCE(state);
+    READ_ONCE(state->finish);
+    READ_ONCE(state->turn);
     smp_rmb();
 
-    if (finish && turn == 'O') {
-        WRITE_ONCE(finish, 0);
+    if (state->finish && (state->turn == 'O' || state->turn == 'X')) {
+        WRITE_ONCE(state->finish, 0);
         smp_wmb();
-        queue_work(kxo_workqueue, &ai_one_work);
-    } else if (finish && turn == 'X') {
-        WRITE_ONCE(finish, 0);
-        smp_wmb();
-        queue_work(kxo_workqueue, &ai_two_work);
     }
     queue_work(kxo_workqueue, &drawboard_work);
     tv_end = ktime_get();
 
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
-
+    /* SoftIRQ means interrupt by software */
     pr_info("kxo: [CPU#%d] %s in_softirq: %llu usec\n", smp_processor_id(),
             __func__, (unsigned long long) nsecs >> 10);
 }
 
-/* Tasklet for asynchronous bottom-half processing in softirq context */
-static DECLARE_TASKLET_OLD(game_tasklet, game_tasklet_func);
-
-static void ai_game(void)
+static void ai_game(int game_id)
 {
     WARN_ON_ONCE(!irqs_disabled());
 
     pr_info("kxo: [CPU#%d] doing AI game\n", smp_processor_id());
     pr_info("kxo: [CPU#%d] scheduling tasklet\n", smp_processor_id());
-    tasklet_schedule(&game_tasklet);
+    if (game_id == 1)
+        tasklet_schedule(&game_tasklet1);
+    if (game_id == 2)
+        tasklet_schedule(&game_tasklet2);
 }
 
 static void timer_handler(struct timer_list *__timer)
@@ -329,10 +364,14 @@ static void timer_handler(struct timer_list *__timer)
 
     tv_start = ktime_get();
 
-    char win = check_win(table);
+    char win_1 = check_win(game_state_1->table);
+    char win_2 = check_win(game_state_2->table);
 
-    if (win == ' ') {
-        ai_game();
+    if ((win_1 == ' ') || (win_2 == ' ')) {
+        if (win_1 == ' ')
+            ai_game(1);
+        if (win_2 == ' ')
+            ai_game(2);
         mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
     } else {
         read_lock(&attr_obj.lock);
@@ -348,16 +387,21 @@ static void timer_handler(struct timer_list *__timer)
 
             wake_up_interruptible(&rx_wait);
         }
-
+        /* Reset the gmae table for two games */
         if (attr_obj.end == '0') {
-            memset(table, ' ',
-                   N_GRIDS); /* Reset the table so the game restart */
+            if (win_1 != ' ')
+                memset(game_state_1->table, ' ', N_GRIDS);
+            if (win_2 != ' ')
+                memset(game_state_2->table, ' ', N_GRIDS);
             mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
         }
 
         read_unlock(&attr_obj.lock);
 
-        pr_info("kxo: %c win!!!\n", win);
+        if (win_1 != ' ')
+            pr_info("game1: kxo: %c win!!!\n", win_1);
+        if (win_2 != ' ')
+            pr_info("game2: kxo: %c win!!!\n", win_2);
     }
     tv_end = ktime_get();
 
@@ -444,6 +488,32 @@ static int __init kxo_init(void)
 {
     dev_t dev_id;
     int ret;
+    /* Initialize the game state */
+    game_state_1 = kmalloc(sizeof(game_state), GFP_KERNEL);
+    game_state_2 = kmalloc(sizeof(game_state), GFP_KERNEL);
+    init_game_state(game_state_1);
+    init_game_state(game_state_2);
+    /* Setup two tasklets for two independent games */
+    tasklet_setup(&game_tasklet1, game_tasklet_func);
+    tasklet_setup(&game_tasklet2, game_tasklet_func);
+    /* Setup the variable that is passing to the tasklet */
+    game_tasklet1.data = 1;
+    game_tasklet2.data = 2;
+
+    if (!game_state_1) {
+        pr_err("Failed to allocate memory for game states 1\n");
+        kfree(game_state_1);
+        return -ENOMEM;
+    }
+
+    if (!game_state_2) {
+        pr_err("Failed to allocate memory for game states 2\n");
+        kfree(game_state_2);
+        return -ENOMEM;
+    }
+
+
+    /* Initialize the average load data structure*/
     load = kmalloc(sizeof(struct Load), GFP_KERNEL);
     if (!load) {
         pr_info("Failed to allocate memory for Load!\n");
@@ -506,9 +576,6 @@ static int __init kxo_init(void)
 
     negamax_init();
     mcts_init();
-    memset(table, ' ', N_GRIDS);
-    turn = 'O';
-    finish = 1;
 
     attr_obj.display = '1';
     attr_obj.resume = '1';
@@ -542,7 +609,8 @@ static void __exit kxo_exit(void)
     dev_t dev_id = MKDEV(major, 0);
 
     del_timer_sync(&timer);
-    tasklet_kill(&game_tasklet);
+    tasklet_kill(&game_tasklet1);
+    tasklet_kill(&game_tasklet2);
     flush_workqueue(kxo_workqueue);
     destroy_workqueue(kxo_workqueue);
     vfree(fast_buf.buf);

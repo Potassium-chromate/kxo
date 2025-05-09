@@ -26,6 +26,20 @@ typedef struct {
     int i_lower_bound, j_lower_bound, i_upper_bound, j_upper_bound;
 } line_t;
 
+typedef struct {
+    char table[N_GRIDS];
+    char turn;
+    int finish;
+} game_state;
+
+#ifdef __KERNEL__
+#include <linux/workqueue.h>
+struct ai_work {
+    struct work_struct work;
+    int game_num;
+};
+#endif
+
 /* Self-defined fixed-point type, using last 10 bits as fractional bits,
  * starting from lsb */
 #define FIXED_SCALE_BITS 8
@@ -47,4 +61,5 @@ int *available_moves(const char *table);
 char check_win(const char *t);
 fixed_point_t calculate_win_value(char win, char player);
 
+void init_game_state(game_state *state);
 u32 table_compressor(const char *table);

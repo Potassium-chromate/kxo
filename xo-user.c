@@ -126,7 +126,7 @@ int main(int argc, char *argv[])
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
     char display_buf[DRAWBUFFER_SIZE];
-    uint32_t table;
+    uint32_t table1, table2;
     char load_buf[LOAD_SIZE];
 
     fd_set readset;
@@ -158,7 +158,8 @@ int main(int argc, char *argv[])
             FD_CLR(device_fd, &readset);
             printf("\033[H\033[J"); /* ASCII escape code to clear the screen */
             read(device_fd, load_buf, 51);
-            read(device_fd, &table, sizeof(table));
+            read(device_fd, &table1, sizeof(table1));
+            read(device_fd, &table2, sizeof(table2));
             // Print the time
             time(&rawtime);
             timeinfo = localtime(&rawtime);
@@ -168,7 +169,9 @@ int main(int argc, char *argv[])
             // Print the load
             printf("%s", load_buf);
             // Draw the board
-            draw_board(display_buf, table);
+            draw_board(display_buf, table1);
+            printf("%s", display_buf);
+            draw_board(display_buf, table2);
             printf("%s", display_buf);
         }
     }
