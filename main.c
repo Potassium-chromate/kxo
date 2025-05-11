@@ -396,9 +396,9 @@ static void timer_handler(struct timer_list *__timer)
     char win_2 = check_win(game_state_2->table);
 
     if ((win_1 == ' ') || (win_2 == ' ')) {
-        if (win_1 == ' ')
+        if (win_1 == ' ' && game_state_1->finish)
             ai_game(1);
-        if (win_2 == ' ')
+        if (win_2 == ' ' && game_state_2->finish)
             ai_game(2);
         mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
     } else {
