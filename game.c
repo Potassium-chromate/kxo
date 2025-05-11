@@ -83,6 +83,6 @@ u32 table_compressor(const char *table)
 void init_game_state(game_state *state)
 {
     memset(state->table, ' ', N_GRIDS);
-    state->turn = ' ';
-    state->finish = 0;
+    state->turn = 'X';
+    state->finish = 1;
 }

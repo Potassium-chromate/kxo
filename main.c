@@ -93,6 +93,8 @@ static game_state *game_state_2;
 static char load_buf[LOAD_SIZE];
 static struct tasklet_struct game_tasklet1;
 static struct tasklet_struct game_tasklet2;
+/* Workqueue for asynchronous bottom-half processing */
+static struct workqueue_struct *kxo_workqueue_1, *kxo_workqueue_2;
 
 /* Data are stored into a kfifo buffer before passing them to the userspace */
 static DECLARE_KFIFO_PTR(rx_fifo, unsigned char);
@@ -197,8 +199,16 @@ static void ai_one_work_func(struct work_struct *w)
 
     struct ai_work *ai = container_of(w, struct ai_work, work);
     game_state *state = (ai->game_num == 1) ? game_state_1 : game_state_2;
-
     READ_ONCE(state);
+    /* If the turn is not correct, then leave the work */
+    if (state->turn != 'O') {
+        pr_info("kxo: AI_%d work on incorrect turn: %c\n", ai->game_num,
+                state->turn);
+        WRITE_ONCE(state->finish, 1);
+        kfree(ai);
+        return;
+    }
+
     WARN_ON_ONCE(in_softirq());
     WARN_ON_ONCE(in_interrupt());
 
@@ -212,7 +222,7 @@ static void ai_one_work_func(struct work_struct *w)
 
     smp_mb();
 
-    if (move != -1 && state->turn == 'O') {
+    if (move != -1) {
         WRITE_ONCE(state->table[move], 'O');
     }
     WRITE_ONCE(state->turn, 'X');
@@ -240,8 +250,15 @@ static void ai_two_work_func(struct work_struct *w)
 
     struct ai_work *ai = container_of(w, struct ai_work, work);
     game_state *state = (ai->game_num == 1) ? game_state_1 : game_state_2;
-
     READ_ONCE(state);
+    /* If the turn is not correct, then leave the work */
+    if (state->turn != 'X') {
+        pr_info("kxo: AI_%d work on incorrect turn: %c\n", ai->game_num,
+                state->turn);
+        WRITE_ONCE(state->finish, 1);
+        kfree(ai);
+        return;
+    }
     WARN_ON_ONCE(in_softirq());
     WARN_ON_ONCE(in_interrupt());
 
@@ -254,7 +271,7 @@ static void ai_two_work_func(struct work_struct *w)
 
     smp_mb();
 
-    if (move != -1 && state->turn == 'X') {
+    if (move != -1) {
         WRITE_ONCE(state->table[move], 'X');
     }
 
@@ -272,9 +289,6 @@ static void ai_two_work_func(struct work_struct *w)
     put_cpu();
     kfree(ai);
 }
-
-/* Workqueue for asynchronous bottom-half processing */
-static struct workqueue_struct *kxo_workqueue;
 
 /* Work item: holds a pointer to the function that is going to be executed
  * asynchronously.
@@ -307,7 +321,11 @@ static void game_tasklet_func(struct tasklet_struct *t)
     }
 
     /* Add the ai_work to kxo_workqueue */
-    queue_work(kxo_workqueue, &ai->work);
+    if (game_num == 1)
+        queue_work(kxo_workqueue_1, &ai->work);
+    else
+        queue_work(kxo_workqueue_2, &ai->work);
+
 
 
     ktime_t tv_start, tv_end;
@@ -327,7 +345,13 @@ static void game_tasklet_func(struct tasklet_struct *t)
         WRITE_ONCE(state->finish, 0);
         smp_wmb();
     }
-    queue_work(kxo_workqueue, &drawboard_work);
+
+
+    if (game_num == 1)
+        queue_work(kxo_workqueue_1, &drawboard_work);
+    else
+        queue_work(kxo_workqueue_2, &drawboard_work);
+
     tv_end = ktime_get();
 
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
@@ -340,12 +364,15 @@ static void ai_game(int game_id)
 {
     WARN_ON_ONCE(!irqs_disabled());
 
-    pr_info("kxo: [CPU#%d] doing AI game\n", smp_processor_id());
     pr_info("kxo: [CPU#%d] scheduling tasklet\n", smp_processor_id());
-    if (game_id == 1)
+    if (game_id == 1) {
         tasklet_schedule(&game_tasklet1);
-    if (game_id == 2)
+        pr_info("kxo: [CPU#%d] doing AI game 1\n", smp_processor_id());
+    }
+    if (game_id == 2) {
         tasklet_schedule(&game_tasklet2);
+        pr_info("kxo: [CPU#%d] doing AI game\n", smp_processor_id());
+    }
 }
 
 static void timer_handler(struct timer_list *__timer)
@@ -363,7 +390,8 @@ static void timer_handler(struct timer_list *__timer)
     local_irq_disable();
 
     tv_start = ktime_get();
-
+    READ_ONCE(game_state_1);
+    READ_ONCE(game_state_2);
     char win_1 = check_win(game_state_1->table);
     char win_2 = check_win(game_state_2->table);
 
@@ -390,9 +418,9 @@ static void timer_handler(struct timer_list *__timer)
         /* Reset the gmae table for two games */
         if (attr_obj.end == '0') {
             if (win_1 != ' ')
-                memset(game_state_1->table, ' ', N_GRIDS);
+                init_game_state(game_state_1);
             if (win_2 != ' ')
-                memset(game_state_2->table, ' ', N_GRIDS);
+                init_game_state(game_state_2);
             mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
         }
 
@@ -465,7 +493,8 @@ static int kxo_release(struct inode *inode, struct file *filp)
     pr_debug("kxo: %s\n", __func__);
     if (atomic_dec_and_test(&open_cnt)) {
         del_timer_sync(&timer);
-        flush_workqueue(kxo_workqueue);
+        flush_workqueue(kxo_workqueue_1);
+        flush_workqueue(kxo_workqueue_2);
         fast_buf_clear();
     }
     pr_info("release, current cnt: %d\n", atomic_read(&open_cnt));
@@ -568,8 +597,14 @@ static int __init kxo_init(void)
     }
 
     /* Create the workqueue */
-    kxo_workqueue = alloc_workqueue("kxod", WQ_UNBOUND, WQ_MAX_ACTIVE);
-    if (!kxo_workqueue) {
+    kxo_workqueue_1 = alloc_workqueue("kxod_1", WQ_UNBOUND, WQ_MAX_ACTIVE);
+    if (!kxo_workqueue_1) {
+        ret = -ENOMEM;
+        goto error_workqueue;
+    }
+
+    kxo_workqueue_2 = alloc_workqueue("kxod_2", WQ_UNBOUND, WQ_MAX_ACTIVE);
+    if (!kxo_workqueue_2) {
         ret = -ENOMEM;
         goto error_workqueue;
     }
@@ -611,8 +646,10 @@ static void __exit kxo_exit(void)
     del_timer_sync(&timer);
     tasklet_kill(&game_tasklet1);
     tasklet_kill(&game_tasklet2);
-    flush_workqueue(kxo_workqueue);
-    destroy_workqueue(kxo_workqueue);
+    flush_workqueue(kxo_workqueue_1);
+    destroy_workqueue(kxo_workqueue_1);
+    flush_workqueue(kxo_workqueue_2);
+    destroy_workqueue(kxo_workqueue_2);
     vfree(fast_buf.buf);
     device_destroy(kxo_class, dev_id);
     class_destroy(kxo_class);
